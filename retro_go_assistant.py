@@ -219,7 +219,8 @@ class Tip:
             return
         self.tw = tk.Toplevel(self.w); self.tw.wm_overrideredirect(True)
         self.tw.wm_geometry(f"+{self.w.winfo_rootx() + 10}+{self.w.winfo_rooty() + self.w.winfo_height() + 4}")
-        tk.Label(self.tw, text=self.text, justify="left", background="#ffffe0", relief="solid",
+        txt = self.text() if callable(self.text) else self.text
+        tk.Label(self.tw, text=txt, justify="left", background="#ffffe0", relief="solid",
                  borderwidth=1, padx=6, pady=3, wraplength=380).pack()
 
     def hide(self, _=None):
@@ -240,8 +241,14 @@ class Manager(tk.Tk):
         self.apps, self.vars, self.cards, self.status = [], {}, {}, {}
         sv = lambda k, d="": tk.StringVar(value=self.cfg.get(k, d))
         self.proj, self.idf, self.target = sv("project"), sv("idf"), sv("target")
+        self.version, self.flash_img_path = sv("version"), sv("flash_image")
         self.port, self.baud, self.mon = sv("port", "COM4"), sv("baud", "1152000"), sv("monitor", "(auto)")
+        if self.baud.get() not in ("1152000", "921600", "460800", "230400", "115200"):
+            self.baud.set("1152000")
         self.mbaud = sv("mbaud", "auto")
+        self.no_networking = tk.BooleanVar(value=self.cfg.get("no_networking", False))
+        self.erase_flash = tk.BooleanVar(value=self.cfg.get("erase_flash", False))
+        self.erase_first = self.erase_flash
         self.build_ui()
         near = next((d for d in (BASE, os.path.dirname(BASE), os.path.dirname(os.path.dirname(BASE)))
                      if valid_project(d)), None)
@@ -263,17 +270,27 @@ class Manager(tk.Tk):
         r0 = ttk.Frame(top); r0.pack(fill="x")
         ttk.Label(r0, text="Project:", width=8).pack(side="left")
         ttk.Button(r0, text="Reload", command=self.reload).pack(side="right", **P)
+        e_ver = ttk.Entry(r0, textvariable=self.version, width=14)
+        e_ver.pack(side="right", **P)
+        Tip(e_ver, "Custom build version (PROJECT_VER). If blank, git describe is used automatically.")
+        ttk.Label(r0, text="Version:").pack(side="right", padx=(8, 0))
         ttk.Button(r0, text="Browse...", command=self.browse_project).pack(side="right", **P)
         ttk.Entry(r0, textvariable=self.proj).pack(side="left", fill="x", expand=True, **P)
         r1 = ttk.Frame(top); r1.pack(fill="x", pady=(2, 0))
         ttk.Label(r1, text="Target:", width=8).pack(side="left")
         self.cb_target = ttk.Combobox(r1, textvariable=self.target, width=16, state="readonly")
         self.cb_target.pack(side="left", **P)
+        cb_net = ttk.Checkbutton(r1, text="No-Networking", variable=self.no_networking)
+        cb_net.pack(side="left", padx=(6, 3), pady=1)
+        Tip(cb_net, "Build without networking support (--no-networking).")
         ttk.Label(r1, text="  COM:").pack(side="left")
         self.cb_port = ttk.Combobox(r1, textvariable=self.port, width=8); self.cb_port.pack(side="left", **P)
         ttk.Button(r1, text="Refresh", command=self.refresh_ports).pack(side="left", **P)
         ttk.Label(r1, text="  Flash baud:").pack(side="left")
-        ttk.Entry(r1, textvariable=self.baud, width=9).pack(side="left", **P)
+        self.cb_baud = ttk.Combobox(r1, textvariable=self.baud, width=9, state="readonly",
+                                    values=["1152000", "921600", "460800", "230400", "115200"])
+        self.cb_baud.pack(side="left", **P)
+        Tip(self.cb_baud, "Serial baudrate used for flashing (default: 1152000).")
         ttk.Label(r1, text="   ESP-IDF:").pack(side="left")
         ttk.Button(r1, text="Check Environment", command=self.check_env).pack(side="right", **P)
         ttk.Button(r1, text="...", width=3, command=self.browse_idf).pack(side="right", **P)
@@ -298,40 +315,60 @@ class Manager(tk.Tk):
             "<MouseWheel>", lambda ev: self.canvas.yview_scroll(int(-ev.delta / 120), "units")))
         self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
 
-        # actions: BIN and IMG groups side by side (hover a button for details)
+        # actions: BUILD, BUILD-IMG, RELEASE, and FLASH IMAGE groups side by side (hover a button for details)
+        ttk.Style().configure("Act.TButton", padding=(5, 2))
+        PA = dict(padx=2, pady=1)
         act = ttk.Frame(self); act.pack(fill="x", padx=8, pady=2)
         self.btns = []
-        self.erase_first = tk.BooleanVar(value=True)
 
         def group(title, items):
-            g = ttk.LabelFrame(act, text=title); g.pack(side="left", padx=(0, 8))
+            g = ttk.LabelFrame(act, text=title); g.pack(side="left", padx=(0, 6))
             made = []
             for t, c, tip in items:
-                b = ttk.Button(g, text=t, command=c); b.pack(side="left", **P)
+                b = ttk.Button(g, text=t, width=0, style="Act.TButton", command=c); b.pack(side="left", **PA)
                 Tip(b, tip); self.btns.append(b); made.append(b)
             return g, made
 
-        group("BIN \u00b7 update apps on the device",
+        group("BUILD \u00b7 build/flash existing apps on the device",
               (("Build", self.a_build, "Build the selected apps."),
                ("Flash", self.a_flash, "Flash the selected apps only. Cannot add a new app: the partition table stays as it is."),
                ("Build + Flash", self.a_build_flash, "Build, then flash. Stops if the build fails. Existing apps only."),
                ("Clean", self.a_clean, "Clean the selected apps' build folders.")))
-        g, made = group("IMG \u00b7 add new apps (full install)",
-                        (("Build Image", self.a_build_img,
-                          "Build the full flash image (a .img file in the project folder). Needed to add a new core or port, or to change partitions. Does not touch the device."),
-                         ("Erase + Flash Image", self.a_flash_img,
-                          "Flash the LAST BUILT .img only. It does NOT rebuild anything. Erases the whole flash first (if ticked), then writes the image."),
-                         ("Build + Erase + Flash", self.a_build_flash_img,
-                          "Builds the image first, and only then erases and flashes it, so the device is never left blank during the build.")))
-        self.btn_img_flash, self.btn_img_bflash = made[1], made[2]
-        cb = ttk.Checkbutton(g, text="Erase first", variable=self.erase_first, command=self._img_label)
-        cb.pack(side="left", **P)
-        Tip(cb, "Untick to flash the image without erasing the flash first.")
-        ttk.Button(act, text="Monitor", command=self.a_monitor).pack(side="right", **P)
-        ttk.Button(act, text="Stop", command=self.stop).pack(side="right", **P)
-        self.state_lbl = ttk.Label(act, text="Idle"); self.state_lbl.pack(side="right", padx=8)
 
-        mb = ttk.Menubutton(act, text="Tools \u25be"); mb.pack(side="right", **P)
+        erase_tip = ("Erases the entire flash chip before flashing. Useful for troubleshooting, "
+                     "corrupted settings, or partition changes, but not generally required and causes additional flash wear.")
+
+        g_img, _ = group("BUILD-IMG \u00b7 build apps and package into a flash image",
+                         (("Build Image", self.a_build_img,
+                           "Build the full flash image (a .img file in the project folder). Needed to add a new core or port, or to change partitions. Does not touch the device."),
+                          ("Build + Flash", self.a_build_flash_img,
+                           "Builds the image first, and then flashes it to the device.")))
+        cb_img = ttk.Checkbutton(g_img, text="Erase Flash", variable=self.erase_flash)
+        cb_img.pack(side="left", **PA)
+        Tip(cb_img, erase_tip)
+
+        g_rel, _ = group("RELEASE \u00b7 build a production image (no debug)",
+                         (("Build Image", self.a_build_release,
+                           "Clean and build the full flash image in release mode (disables debug logging and enables release optimisations). Does not touch the device."),
+                          ("Build + Flash", self.a_build_flash_release,
+                           "Clean and build the release image first, and then flashes it to the device.")))
+        cb_rel = ttk.Checkbutton(g_rel, text="Erase Flash", variable=self.erase_flash)
+        cb_rel.pack(side="left", **PA)
+        Tip(cb_rel, erase_tip)
+
+        g_flash, _ = group("FLASH IMAGE \u00b7 flash a selected .img",
+                           (("Browse...", self.browse_flash_img,
+                             "Select a .img file to flash (defaults to the project folder)."),
+                            ("Flash Image", self.a_flash_custom_img, self._flash_img_tip)))
+        cb_flash = ttk.Checkbutton(g_flash, text="Erase Flash", variable=self.erase_flash)
+        cb_flash.pack(side="left", **PA)
+        Tip(cb_flash, erase_tip)
+
+        ttk.Button(act, text="Monitor", width=0, style="Act.TButton", command=self.a_monitor).pack(side="right", **PA)
+        ttk.Button(act, text="Stop", width=0, style="Act.TButton", command=self.stop).pack(side="right", **PA)
+        self.state_lbl = ttk.Label(act, text="Idle"); self.state_lbl.pack(side="right", padx=6)
+
+        mb = ttk.Menubutton(act, text="Tools \u25be"); mb.pack(side="right", **PA)
         tm = tk.Menu(mb, tearoff=0); mb["menu"] = tm
         tm.add_command(label="Edit rg_tool.py", command=lambda: self.open_path("rg_tool.py"))
         tm.add_command(label="Open target config", command=self.open_target)
@@ -452,6 +489,26 @@ class Manager(tk.Tk):
         if p:
             self.idf.set(os.path.normpath(p)); self.env = None
 
+    def _flash_img_tip(self):
+        p = self.flash_img_path.get().strip()
+        base = "Flash the selected .img file to the device. Erases the whole flash first if 'Erase Flash' is ticked."
+        return f"{base}\nSelected: {p}" if p else f"{base}\nNo image selected yet (use Browse...)."
+
+    def browse_flash_img(self):
+        cur = self.flash_img_path.get().strip()
+        proj = self.proj.get()
+        cur_dir = os.path.dirname(cur) if cur else ""
+        init_dir = cur_dir if cur_dir and os.path.isdir(cur_dir) else (
+            proj if proj and os.path.isdir(proj) else BASE)
+        p = filedialog.askopenfilename(
+            title="Select flash image (.img)",
+            initialdir=init_dir,
+            filetypes=[("Flash image", "*.img"), ("All files", "*.*")])
+        if p:
+            norm = os.path.normpath(p)
+            self.flash_img_path.set(norm)
+            self.log(f"Selected image: {norm}\n")
+
     # ---- open helpers
     def open_path(self, *parts):
         path = os.path.join(self.proj.get(), *parts)
@@ -504,6 +561,8 @@ class Manager(tk.Tk):
         c = [PY, os.path.join(self.proj.get(), "rg_tool.py"), cmd] + list(apps)
         if self.target.get():
             c += ["--target", self.target.get()]
+        if self.no_networking.get():
+            c += ["--no-networking"]
         if port:
             c += ["--port", self.port.get(), "--baud", self.baud.get()]
         return c
@@ -517,13 +576,14 @@ class Manager(tk.Tk):
     def a_build_img(self):
         s = self.sel(); s and self.run([("Build Image", self.rg("build-img", s))])
 
+    def a_build_release(self):
+        s = self.sel(); s and self.run([("Build Release Image", self.rg("release", s))])
+
     def a_flash(self):
         s = self.sel(); s and self.run([("Flash", self.rg("flash", s, True))])
 
     def _img_label(self):
-        e = self.erase_first.get()
-        self.btn_img_flash.config(text="Erase + Flash Image" if e else "Flash Image")
-        self.btn_img_bflash.config(text="Build + Erase + Flash" if e else "Build + Flash Image")
+        pass
 
     def find_image(self):
         """Newest .img in the project folder (where rg_tool.py writes it), preferring the current target."""
@@ -535,11 +595,11 @@ class Manager(tk.Tk):
         mine = [f for f in found if t and t in os.path.basename(f).lower()]
         return max(mine or found, key=os.path.getmtime)
 
-    def _flash_image_job(self, erase):
+    def _flash_image_job(self, erase, img_path=None):
         """Runs inside the worker. Looks the image up BEFORE erasing, so a missing image never leaves a blank board."""
-        img = self.find_image()
-        if not img:
-            self.log("\nNo .img file found in the project folder. Click 'Build Image' first.\n")
+        img = img_path or self.find_image()
+        if not img or not os.path.isfile(img):
+            self.log("\nNo .img file found. Select a valid .img file or click 'Build Image' first.\n")
             raise RuntimeError("no image to flash")
         self.log(f"\nImage: {img}\nBuilt: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(img)))}"
                  f"  ({os.path.getsize(img) / 1048576:.1f} MB)\n")
@@ -565,30 +625,45 @@ class Manager(tk.Tk):
             + extra + "\n\nAnything stored in internal flash (saves, settings) will be lost.\n\nContinue?",
             icon="warning")
 
-    def a_flash_img(self):
-        """Flash the last built image. Never rebuilds."""
-        img = self.find_image()
-        if not img:
-            messagebox.showinfo("Retro-Go Assistant", "No .img file found in the project folder.\nClick 'Build Image' first.")
+    def a_flash_custom_img(self):
+        """Flash the user-selected .img file."""
+        raw = self.flash_img_path.get().strip()
+        if not raw:
+            messagebox.showinfo("Retro-Go Assistant", "Select a .img file first using 'Browse...'.")
+            return
+        img = raw if os.path.isabs(raw) else os.path.join(self.proj.get(), raw)
+        if not os.path.isfile(img):
+            messagebox.showerror("Image not found", f"The selected image file was not found:\n{img}")
             return
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(img)))
-        erase = self.erase_first.get()
+        erase = self.erase_flash.get()
         if erase and not self._confirm_erase(f"\n\nImage: {os.path.basename(img)}\nBuilt: {when}"):
             return
         if not erase and not messagebox.askyesno(
-                "Flash Image", f"Flash {os.path.basename(img)} (built {when}) without erasing first?"):
+                "Flash Image", f"Flash {os.path.basename(img)} (built {when}) to {self.port.get()}?"):
             return
-        self.run([("Flash Image", lambda: self._flash_image_job(erase))])
+        self.run([("Flash Image", lambda: self._flash_image_job(erase, img))])
 
     def a_build_flash_img(self):
-        """Build the image first, THEN erase and flash, so the board stays usable during the long build."""
+        """Build the image first, then flash."""
         s = self.sel()
         if not s:
             return
-        erase = self.erase_first.get()
+        erase = self.erase_flash.get()
         if erase and not self._confirm_erase("\n\nThe image is built first; the erase only starts after the build succeeds."):
             return
         self.run([("Build Image", self.rg("build-img", s)),
+                  ("Flash Image", lambda: self._flash_image_job(erase))])
+
+    def a_build_flash_release(self):
+        """Build the release image first, then flash."""
+        s = self.sel()
+        if not s:
+            return
+        erase = self.erase_flash.get()
+        if erase and not self._confirm_erase("\n\nThe release image is built first; the erase only starts after the build succeeds."):
+            return
+        self.run([("Build Release Image", self.rg("release", s)),
                   ("Flash Image", lambda: self._flash_image_job(erase))])
 
     def a_clean(self):
@@ -660,6 +735,13 @@ class Manager(tk.Tk):
                 resume = True; self.stop_monitor(wait=True)  # free the COM port for flashing
             if not steps[0][0].startswith("Tools") and not self.prepare():
                 result = "Environment error"; return
+            if self.env:
+                ver = self.version.get().strip()
+                if ver:
+                    self.env["PROJECT_VER"] = ver
+                    self.log(f"Version: {ver} (PROJECT_VER)\n")
+                else:
+                    self.env.pop("PROJECT_VER", None)
             for label, job in steps:
                 self.cur_tab = self.tab_of(label)
                 self.q.put(("state", label + "..."))
@@ -823,10 +905,12 @@ class Manager(tk.Tk):
         self.run([("Tools: build exe", self._exe)])
 
     def _exe(self):
-        py = shutil.which("python") or shutil.which("py")
+        py = shutil.which("py")
+        has_313 = py and subprocess.run([py, "-3.13", "--version"], capture_output=True, creationflags=NOWIN).returncode == 0
+        py_cmd = [py, "-3.13"] if has_313 else [shutil.which("python") or "python"]
         tmp = tempfile.gettempdir()
-        for argv in ([py, "-m", "pip", "install", "--user", "pyinstaller"],
-                     [py, "-m", "PyInstaller", "--onefile", "--windowed", "--name", "RetroGoAssistant",
+        for argv in ([*py_cmd, "-m", "pip", "install", "--user", "pyinstaller"],
+                     [*py_cmd, "-m", "PyInstaller", "--onefile", "--windowed", "--name", "RetroGoAssistant",
                       "--distpath", os.path.join(BASE, "dist"), "--workpath", os.path.join(tmp, "rgm_build"),
                       "--specpath", tmp, os.path.abspath(__file__)]):
             if self.stream(argv, env=dict(os.environ), cwd=BASE) != 0:
@@ -840,6 +924,9 @@ class Manager(tk.Tk):
     def save(self):
         d = dict(project=self.proj.get(), idf=self.idf.get(), target=self.target.get(), port=self.port.get(),
                  baud=self.baud.get(), mbaud=self.mbaud.get(), monitor=self.mon.get(),
+                 version=self.version.get(), flash_image=self.flash_img_path.get(),
+                 no_networking=self.no_networking.get(),
+                 erase_flash=self.erase_flash.get(),
                  apps=[a for a, v in self.vars.items() if v.get()])
         try:
             with open(CFG, "w", encoding="utf-8") as f:
